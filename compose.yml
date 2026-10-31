@@ -1,0 +1,13 @@
+
+services:
+  controller:
+    build: .
+    container_name: firmware-controller
+    ports:
+      - "8080:8080"
+    volumes:
+      - firmware-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  firmware-data:

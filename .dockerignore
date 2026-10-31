@@ -1,0 +1,6 @@
+.git
+.vscode
+data
+*.mv.db
+*.trace.db
+README.md
