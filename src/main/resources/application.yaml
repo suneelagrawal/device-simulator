@@ -30,3 +30,7 @@ management:
 
 simulator:
   base-url: ${SIMULATOR_BASE_URL:http://localhost:9000}
+
+
+campaign:
+  scheduler-delay-ms: 2000

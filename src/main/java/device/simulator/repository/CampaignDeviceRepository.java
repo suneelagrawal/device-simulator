@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Collection;
 
 public interface CampaignDeviceRepository
         extends JpaRepository<CampaignDevice, Long> {
@@ -17,4 +18,10 @@ public interface CampaignDeviceRepository
 
     long countByCampaignIdAndState(
             String campaignId, String state);
+
+    List<CampaignDevice> findByCampaignIdAndState(
+            String campaignId, String state);
+
+    boolean existsByDeviceIdAndStateIn(
+            String deviceId, Collection<String> states);
 }
