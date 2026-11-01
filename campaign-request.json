@@ -1,0 +1,10 @@
+
+{
+  "targetVersion": "2.0.0",
+  "imageUrl": "https://example.com/firmware/2.0.0.bin",
+  "deviceFilter": {
+    "currentVersion": "1.0.0"
+  },
+  "maxConcurrent": 3,
+  "failureThresholdPercent": 20
+}
