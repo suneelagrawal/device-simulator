@@ -1,186 +1,240 @@
+
 # Firmware Upgrade Campaign Controller
 
-A Java/Spring Boot application for coordinating firmware upgrade campaigns across a fleet of simulated broadband gateways. It provides operator APIs, persistent campaign and device state, a scheduler that limits concurrent upgrades, and asynchronous gateway callback handling.
+A Java/Spring Boot application for managing firmware upgrade campaigns across a fleet of simulated broadband gateways.
 
-> **Implementation status:** Campaign management, gateway callback endpoints, command persistence, and an initial single-instance scheduler are implemented. Timeout recovery, automatic failure-threshold enforcement, robust concurrent event handling, and production-scale testing are still in progress.
+The application provides campaign management APIs, persistent device and command tracking, asynchronous gateway communication, scheduled upgrade orchestration, concurrency limits, and recovery controls.
 
-## Tech Stack
+## Technology Stack
 
-- Java 17 (compile target), Spring Boot 4.1.2, Maven
-- Spring Web MVC, Spring Data JPA, Spring Scheduling, Spring Boot Actuator
-- File-backed H2 database
-- Python, FastAPI, Uvicorn, HTTPX gateway simulator
+- Java 17 (compile target)
+- Spring Boot 4.1.2
+- Maven
+- Spring Web MVC
+- Spring Data JPA
+- Spring Scheduling
+- Spring Boot Actuator
+- H2 file-based database
+- Python 3
+- FastAPI, Uvicorn, HTTPX
 - Docker and Docker Compose
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    OP[Operator / curl]
-    subgraph CTRL[Spring Boot Firmware Controller]
-        API[Campaign and Device REST APIs]
-        CS[CampaignService]
-        DS[CampaignDispatchService]
-        SCH[CampaignScheduler]
-        US[DeviceUpgradeService]
+    OP["Operator / API Client"]
+
+    subgraph CTRL["Spring Boot Firmware Controller"]
+        API["Campaign & Device REST APIs"]
+        CS["Campaign Service"]
+        SCH["Campaign Scheduler"]
+        DS["Campaign Dispatch Service"]
+        RS["Campaign Recovery Service"]
+        US["Device Upgrade Service"]
+
         API --> CS
         API --> US
         SCH --> DS
+        SCH --> RS
     end
-    DB[(H2: campaigns / campaign_devices / upgrade_commands)]
-    SIM[Python Gateway Simulator]
 
-    OP -->|Create, query, pause, resume| API
+    DB[("H2 Database")]
+    SIM["Python Gateway Simulator"]
+
+    OP -->|"Create / Monitor / Pause / Resume"| API
+
     CS <--> DB
     DS <--> DB
+    RS <--> DB
     US <--> DB
-    SCH -->|POST connection-request| SIM
-    CS -->|GET eligible devices| SIM
-    SIM -->|POST Inform / Command Response| API
-    API -->|DOWNLOAD in Inform response| SIM
+
+    CS -->|"Device Inventory"| SIM
+    SCH -->|"Connection Request"| SIM
+    SIM -->|"Inform / Command Response"| API
+    API -->|"DOWNLOAD Command"| SIM
 ```
 
 ### Component Responsibilities
 
 | Component | Responsibility |
 |---|---|
-| `CampaignController` | Operator-facing create, status, pause, and resume APIs |
-| `CampaignService` | Load eligible inventory, persist campaigns/devices, summarize progress |
-| `CampaignScheduler` | Periodically process running campaigns and send connection requests |
-| `CampaignDispatchService` | Reserve pending devices while respecting per-campaign available slots |
-| `DeviceController` | Accept gateway Inform and command-response callbacks |
-| `DeviceUpgradeService` | Persist DOWNLOAD commands, process acknowledgments and completion events |
-| H2 | Persist campaigns, per-device states, and command correlation records |
-| Python simulator | Simulate gateway inventory, downloads, reboots, and callback scenarios |
+| CampaignController | Campaign creation, status, pause, resume |
+| CampaignService | Campaign management and device inventory integration |
+| CampaignScheduler | Periodic dispatch, recovery, and lifecycle evaluation |
+| CampaignDispatchService | Device reservations and concurrency limits |
+| CampaignRecoveryService | Timeouts, notification retries, failure threshold, completion |
+| DeviceController | Gateway Inform and command-response endpoints |
+| DeviceUpgradeService | DOWNLOAD command issuance, acknowledgments, completion |
+| H2 Database | Persistent campaign, device, and command records |
+| Python Simulator | Simulated gateway behavior and asynchronous callbacks |
 
 ## Firmware Upgrade Sequence
 
 ```mermaid
 sequenceDiagram
     autonumber
+
     actor O as Operator
     participant C as Spring Boot Controller
-    participant DB as H2
+    participant DB as H2 Database
     participant G as Gateway Simulator
 
     O->>C: POST /campaigns
     C->>G: GET /devices?version=1.0.0
-    G-->>C: Eligible devices
+    G-->>C: Eligible gateways
     C->>DB: Persist campaign and PENDING devices
-    C-->>O: Campaign ID and initial status
+    C-->>O: Campaign ID
 
-    loop Scheduler ticks while campaign RUNNING
-        C->>DB: Reserve available PENDING devices as NOTIFIED
-        C->>G: POST /devices/{id}/connection-request
+    loop Scheduler while campaign RUNNING
+        C->>DB: Reserve available devices as NOTIFIED
+        C->>G: POST connection-request
         G-->>C: 202 Accepted
-        G->>C: POST /devices/{id}/inform
-        C->>DB: Persist unique commandKey and DOWNLOAD_SENT
-        C-->>G: commands: [DOWNLOAD]
-        G->>C: POST /devices/{id}/command-response (ACCEPTED)
-        C->>DB: Update command/device status
-        Note over G: Simulate download and reboot
+
+        G->>C: POST Inform
+        C->>DB: Save commandKey and DOWNLOAD_SENT
+        C-->>G: DOWNLOAD command
+
+        G->>C: Command Response ACCEPTED
+        C->>DB: Update ACCEPTED state
+
+        Note over G: Simulate firmware download and reboot
+
         alt Successful TransferComplete
-            G->>C: Inform (TRANSFER_COMPLETE, commandKey, faultCode=0)
-            C->>DB: Mark upgrade SUCCEEDED
-        else BOOT with target firmware
-            G->>C: Inform (BOOT, firmwareVersion=target)
-            C->>DB: Confirm upgrade SUCCEEDED
+            G->>C: Inform with TransferComplete
+            C->>DB: Record SUCCEEDED
+        else BOOT with target version
+            G->>C: Inform BOOT with target firmware
+            C->>DB: Record SUCCEEDED
         else Upgrade failure
-            G->>C: Reject command or report nonzero faultCode
+            G->>C: Rejection or fault code
             C->>DB: Record FAILED
+        else No response before deadline
+            C->>DB: Record TIMED_OUT
         end
     end
 
+    C->>DB: Evaluate failure threshold and completion
+
     O->>C: GET /campaigns/{id}
-    C-->>O: Campaign status and per-state counts
+    C-->>O: Campaign status and device counts
 ```
 
-The `deviceId` identifies a gateway. A `commandKey` identifies one specific DOWNLOAD command so that asynchronous responses can be correlated with it.
+### Important Identifiers
 
-## Device State Machine
+**deviceId** identifies a simulated gateway.
+
+**commandKey** uniquely identifies a DOWNLOAD command and correlates asynchronous acknowledgments and completion events.
+
+Each command key is persisted before the DOWNLOAD response is returned.
+
+## Device Upgrade State Machine
 
 ```mermaid
 flowchart TD
-    P[PENDING] -->|Scheduler reserves device| N[NOTIFIED]
-    N -->|Inform; DOWNLOAD issued| D[DOWNLOAD_SENT]
-    D -->|Command accepted| A[ACCEPTED]
-    D -->|Command rejected| F[FAILED]
-    A -->|Transfer fault| F
-    D -->|BOOT reports target firmware| S[SUCCEEDED]
-    A -->|Successful TransferComplete| S
-    A -->|BOOT reports target firmware| S
-    N -.->|Timeout handling: planned| T[TIMED_OUT]
-    D -.->|Timeout handling: planned| T
-    A -.->|Timeout handling: planned| T
+    P["PENDING"]
+    N["NOTIFIED"]
+    D["DOWNLOAD_SENT"]
+    A["ACCEPTED"]
+    S["SUCCEEDED"]
+    F["FAILED"]
+    T["TIMED_OUT"]
+
+    P -->|"Scheduler reserves device"| N
+    N -->|"Inform / DOWNLOAD issued"| D
+    D -->|"Command accepted"| A
+
+    D -->|"Command rejected"| F
+    A -->|"Transfer fault"| F
+
+    D -->|"BOOT reports target version"| S
+    A -->|"Successful TransferComplete"| S
+    A -->|"BOOT reports target version"| S
+    D -->|"Successful TransferComplete"| S
+
+    N -->|"Notification retry limit exceeded"| T
+    D -->|"Acknowledgment timeout"| T
+    A -->|"Completion timeout"| T
 ```
 
-| Device state | Meaning |
-|---|---|
-| `PENDING` | Eligible; not yet selected for an upgrade |
-| `NOTIFIED` | Selected and connection request initiated |
-| `DOWNLOAD_SENT` | DOWNLOAD returned in an Inform response |
-| `ACCEPTED` | Gateway acknowledged the DOWNLOAD command |
-| `SUCCEEDED` | Positive upgrade confirmation received |
-| `FAILED` | Rejection or reported transfer error |
-| `TIMED_OUT` | Planned terminal state for an expired operation; timeout enforcement remains pending |
+### Device State Descriptions
 
-> The diagrams describe the implemented happy path and the intended handling of certain failure paths. Comprehensive late-event, duplicate-event, and timeout behavior remains to be hardened.
+| State | Meaning |
+|---|---|
+| PENDING | Device eligible but not yet scheduled |
+| NOTIFIED | Connection request initiated; awaiting Inform |
+| DOWNLOAD_SENT | DOWNLOAD command issued |
+| ACCEPTED | Device acknowledged DOWNLOAD |
+| SUCCEEDED | Upgrade success confirmed |
+| FAILED | Command rejected or upgrade fault reported |
+| TIMED_OUT | Operation exceeded configured deadline |
+
+`SUCCEEDED`, `FAILED`, and `TIMED_OUT` are terminal states in the current MVP.
+
+The implementation does not automatically resend a DOWNLOAD command after its delivery becomes uncertain.
 
 ## Project Structure
 
 ```text
-src/main/java/device/simulator/
-├── DeviceSimulatorApplication.java
-├── controller/
-│   ├── CampaignController.java
-│   └── DeviceController.java
-├── dto/
-│   ├── CreateCampaignRequest.java
-│   ├── CampaignStatusResponse.java
-│   ├── DeviceInformRequest.java
-│   └── DeviceCommandResponse.java
-├── entity/
-│   ├── Campaign.java
-│   ├── CampaignDevice.java
-│   └── UpgradeCommand.java
-├── repository/
-│   ├── CampaignRepository.java
-│   ├── CampaignDeviceRepository.java
-│   └── UpgradeCommandRepository.java
-├── scheduler/
-│   └── CampaignScheduler.java
-└── service/
-    ├── CampaignService.java
-    ├── CampaignDispatchService.java
-    └── DeviceUpgradeService.java
-
-src/main/resources/application.yaml
-src/test/java/device/simulator/DeviceSimulatorApplicationTests.java
-simulator/device_simulator.py
-simulator/run-simulator.cmd
-campaign-request.json
-compose.yml
-README.md
+device-simulator/
+├── src/
+│   ├── main/
+│   │   ├── java/device/simulator/
+│   │   │   ├── DeviceSimulatorApplication.java
+│   │   │   ├── controller/
+│   │   │   │   ├── CampaignController.java
+│   │   │   │   └── DeviceController.java
+│   │   │   ├── dto/
+│   │   │   │   ├── CreateCampaignRequest.java
+│   │   │   │   ├── CampaignStatusResponse.java
+│   │   │   │   ├── DeviceInformRequest.java
+│   │   │   │   └── DeviceCommandResponse.java
+│   │   │   ├── entity/
+│   │   │   │   ├── Campaign.java
+│   │   │   │   ├── CampaignDevice.java
+│   │   │   │   └── UpgradeCommand.java
+│   │   │   ├── repository/
+│   │   │   │   ├── CampaignRepository.java
+│   │   │   │   ├── CampaignDeviceRepository.java
+│   │   │   │   └── UpgradeCommandRepository.java
+│   │   │   ├── service/
+│   │   │   │   ├── CampaignService.java
+│   │   │   │   ├── CampaignDispatchService.java
+│   │   │   │   ├── CampaignRecoveryService.java
+│   │   │   │   └── DeviceUpgradeService.java
+│   │   │   └── scheduler/
+│   │   │       └── CampaignScheduler.java
+│   │   └── resources/
+│   │       └── application.yaml
+│   └── test/
+│       └── java/device/simulator/
+│           └── DeviceSimulatorApplicationTests.java
+├── simulator/
+│   ├── device_simulator.py
+│   └── run-simulator.cmd
+├── campaign-request.json
+├── compose.yml
+├── mvnw.cmd
+└── README.md
 ```
 
 ## Prerequisites
 
-- JDK 17+ (the project targets Java 17 bytecode)
-- Maven wrapper (`mvnw.cmd` is included)
-- Python 3 and pip
-- Optional: Docker Desktop with Docker Compose
+- JDK 17 or later
+- Python 3
+- Maven wrapper included with the project
+- Docker Desktop (optional)
+- Windows Command Prompt or VS Code terminal
 
-Run commands from the project root. On Windows Command Prompt:
+The project compiles to Java 17 bytecode, even when a newer JDK is installed.
 
-```cmd
-cd C:\my_springboot\device-simulator
-```
+## Application Configuration
 
-## Configuration
+Configuration is maintained in:
 
-Application settings are in `src/main/resources/application.yaml`. The local controller listens on port `8080` and connects to the simulator on port `9000`.
+`src/main/resources/application.yaml`
 
-Relevant settings (preserve the other properties already present in your configuration):
+### H2 Configuration
 
 ```yaml
 spring:
@@ -189,57 +243,76 @@ spring:
     driver-class-name: org.h2.Driver
     username: sa
     password:
+
   jpa:
     hibernate:
       ddl-auto: update
+
   h2:
     console:
       enabled: true
       path: /h2-console
+```
 
+### Simulator and Campaign Configuration
+
+```yaml
 simulator:
   base-url: ${SIMULATOR_BASE_URL:http://localhost:9000}
 
 campaign:
   scheduler-delay-ms: 2000
+  max-notification-attempts: 3
+  notification-timeout-seconds: 15
+  acknowledgment-timeout-seconds: 20
+  upgrade-timeout-seconds: 90
+  failure-min-sample-size: 5
 ```
 
-The H2 URL is relative to the application working directory. Local and Docker runs may use separate database files or volumes. Do not run two independent controller processes against the same file-based H2 database without an appropriate multi-process access configuration.
+These timeout values are configured for local MVP testing, not production use.
 
-For tests, `DeviceSimulatorApplicationTests` uses an in-memory H2 URL so `mvnw.cmd clean package` does not contend with the local persistent database.
+### Configuration Parameters
 
-### Python Simulator Settings
-
-On Windows, `simulator/run-simulator.cmd` sets the simulator environment variables and launches Uvicorn. No `.env` file is required.
-
-| Variable | Local test value | Purpose |
-|---|---|---|
-| `CONTROLLER_URL` | `http://localhost:8080` | URL receiving gateway callbacks |
-| `DEVICE_COUNT` | `10` | Number of simulated gateways |
-| `PERIODIC_INFORM_SEC` | `300` | Periodic Inform interval |
-| `DOWNLOAD_MIN_SEC` | `2` | Minimum simulated download delay |
-| `DOWNLOAD_MAX_SEC` | `5` | Maximum simulated download delay |
-| `REBOOT_MIN_SEC` | `2` | Minimum simulated reboot delay |
-| `REBOOT_MAX_SEC` | `5` | Maximum simulated reboot delay |
-
-To change fleet size, edit `DEVICE_COUNT` in the CMD script and restart the simulator. Restarting the simulator resets its in-memory gateway state; persisted controller campaign records are not reset automatically.
+| Parameter | Description |
+|---|---|
+| scheduler-delay-ms | Delay between scheduler executions |
+| max-notification-attempts | Maximum connection request attempts, including initial attempt |
+| notification-timeout-seconds | Time to wait for device Inform |
+| acknowledgment-timeout-seconds | Time to wait for DOWNLOAD acknowledgment |
+| upgrade-timeout-seconds | Time to wait for upgrade completion |
+| failure-min-sample-size | Minimum terminal outcomes before evaluating failure threshold |
 
 ## Build and Run Locally
 
-### 1. Install simulator dependencies
+Open VS Code and navigate to the project root:
 
 ```cmd
-py -m pip install fastapi uvicorn httpx
+cd C:\my_springboot\device-simulator
 ```
 
-### 2. Start Spring Boot — terminal 1
+### Build
 
 ```cmd
 mvnw.cmd clean package
+```
+
+Expected:
+
+```text
+BUILD SUCCESS
+```
+
+The Maven context-loading test uses a separate in-memory H2 database to avoid interfering with the persistent application database.
+
+### Start Spring Boot
+
+```cmd
 mvnw.cmd spring-boot:run
 ```
 
-Health check:
+The controller runs on port `8080`.
+
+Verify:
 
 ```cmd
 curl http://localhost:8080/actuator/health
@@ -251,28 +324,92 @@ Expected:
 {"status":"UP"}
 ```
 
-### 3. Start Python simulator — terminal 2
+## Python Gateway Simulator
+
+The Python simulator provides:
+
+- Gateway inventory
+- Connection request handling
+- Periodic Inform events
+- DOWNLOAD command acknowledgments
+- Firmware download simulation
+- Reboot simulation
+- Successful completion callbacks
+- Rejected commands and transfer failures
+- Offline, delayed, and duplicate-event scenarios
+
+### Install Dependencies
+
+```cmd
+py -m pip install fastapi uvicorn httpx
+```
+
+### Windows Startup Script
+
+The `simulator/run-simulator.cmd` script contains:
+
+```bat
+@echo off
+cd /d "%~dp0.."
+
+set CONTROLLER_URL=http://localhost:8080
+set DEVICE_COUNT=10
+set PERIODIC_INFORM_SEC=300
+set DOWNLOAD_MIN_SEC=2
+set DOWNLOAD_MAX_SEC=5
+set REBOOT_MIN_SEC=2
+set REBOOT_MAX_SEC=5
+
+py -m uvicorn device_simulator:app --app-dir simulator --port 9000
+```
+
+The script avoids manually setting environment variables before every test.
+
+No Python `.env` file is required.
+
+### Start Simulator
+
+From the project root:
 
 ```cmd
 simulator\run-simulator.cmd
 ```
 
-Verify inventory in a separate terminal:
+The simulator listens on port `9000`.
+
+### Validate Device Inventory
 
 ```cmd
 curl http://localhost:9000/devices
+```
+
+Filter by source firmware version:
+
+```cmd
 curl "http://localhost:9000/devices?version=1.0.0"
 ```
 
-With the default test script, the simulator initializes 10 gateways running version `1.0.0`.
+With the local test configuration, the simulator initializes 10 gateways using firmware version `1.0.0`.
 
-### 4. Optional: Run controller in Docker
+Restarting the simulator resets its simulated device state, but does not erase the controller's persisted H2 campaign records.
 
-Stop any local Spring Boot process using port `8080`, then run:
+## Docker Compose
+
+Build the application:
 
 ```cmd
 mvnw.cmd clean package
+```
+
+Start:
+
+```cmd
 docker compose up --build -d
+```
+
+Check health:
+
+```cmd
 curl http://localhost:8080/actuator/health
 ```
 
@@ -282,38 +419,50 @@ Stop:
 docker compose down
 ```
 
-When the Python simulator runs on the Windows host but Spring Boot runs inside Docker, set the controller's `SIMULATOR_BASE_URL` to `http://host.docker.internal:9000` through the container environment/Compose configuration. The simulator should remain configured to call the host-accessible controller at `http://localhost:8080`.
+When Spring Boot runs inside Docker and Python runs on the Windows host, configure:
 
-## REST API Reference
+```text
+SIMULATOR_BASE_URL=http://host.docker.internal:9000
+```
 
-| Method | Endpoint | Purpose |
+through the container environment or Compose configuration.
+
+The local Maven execution and Docker execution may use different H2 storage locations.
+
+## REST APIs
+
+| Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/campaigns` | Create a new campaign for eligible gateways |
-| `GET` | `/campaigns/{id}` | Return campaign status, device counts, and failure rate |
-| `POST` | `/campaigns/{id}/pause` | Stop scheduling new devices for a campaign |
-| `POST` | `/campaigns/{id}/resume` | Re-enable scheduling |
-| `POST` | `/devices/{deviceId}/inform` | Process a gateway event and optionally return a DOWNLOAD command |
-| `POST` | `/devices/{deviceId}/command-response` | Record ACCEPTED or REJECTED acknowledgment |
+| POST | /campaigns | Create campaign |
+| GET | /campaigns/{id} | Retrieve campaign status |
+| POST | /campaigns/{id}/pause | Pause campaign |
+| POST | /campaigns/{id}/resume | Resume campaign |
+| POST | /devices/{deviceId}/inform | Process gateway Inform |
+| POST | /devices/{deviceId}/command-response | Process DOWNLOAD acknowledgment |
 
-### Create Campaign
+## Create Firmware Upgrade Campaign
 
-Example `campaign-request.json`:
+Create `campaign-request.json` in the project root:
 
 ```json
 {
   "targetVersion": "2.0.0",
   "imageUrl": "https://example.com/firmware/2.0.0.bin",
-  "deviceFilter": {"currentVersion": "1.0.0"},
+  "deviceFilter": {
+    "currentVersion": "1.0.0"
+  },
   "maxConcurrent": 3,
   "failureThresholdPercent": 20
 }
 ```
 
+Execute:
+
 ```cmd
 curl -X POST http://localhost:8080/campaigns -H "Content-Type: application/json" --data-binary "@campaign-request.json"
 ```
 
-An example initial response (the ID is generated dynamically):
+Example initial response:
 
 ```json
 {
@@ -321,59 +470,116 @@ An example initial response (the ID is generated dynamically):
   "status": "RUNNING",
   "targetVersion": "2.0.0",
   "totalDevices": 10,
-  "deviceCounts": {"PENDING": 10},
+  "deviceCounts": {
+    "PENDING": 10
+  },
   "failureRatePercent": 0.0
 }
 ```
 
-Each POST creates a new campaign, even if request parameters are identical. When testing the scheduler, pause older `RUNNING` campaigns before starting a new campaign to avoid competition for the same simulated gateways.
+Each POST creates a new campaign with a unique identifier.
 
-### Get, Pause, Resume
+The controller queries the simulator for eligible gateways and persists the campaign and gateway records.
 
-Replace `CAMPAIGN_ID` with the actual generated ID:
+## Campaign Status
 
 ```cmd
 curl http://localhost:8080/campaigns/CAMPAIGN_ID
+```
+
+The response includes:
+
+- Campaign ID
+- Campaign status
+- Target firmware version
+- Total eligible gateways
+- Device counts grouped by state
+- Observed failure percentage
+
+## Pause and Resume
+
+### Pause
+
+```cmd
 curl -X POST http://localhost:8080/campaigns/CAMPAIGN_ID/pause
-curl http://localhost:8080/campaigns/CAMPAIGN_ID
-curl -X POST http://localhost:8080/campaigns/CAMPAIGN_ID/resume
-curl http://localhost:8080/campaigns/CAMPAIGN_ID
 ```
 
-The verified status sequence is `RUNNING → PAUSED → RUNNING`. The scheduler selects new devices only for running campaigns; already in-flight devices may still finish after a pause.
+Expected transition:
 
-### Device Inform
+```text
+RUNNING -> PAUSED
+```
 
-Example Inform when no upgrade is reserved:
+### Resume
 
 ```cmd
-curl -X POST http://localhost:8080/devices/YOUR_DEVICE_ID/inform -H "Content-Type: application/json" -d "{\"deviceId\":\"YOUR_DEVICE_ID\",\"firmwareVersion\":\"1.0.0\",\"event\":\"PERIODIC\"}"
+curl -X POST http://localhost:8080/campaigns/CAMPAIGN_ID/resume
 ```
 
-Verified empty-command response:
+Expected transition:
 
-```json
-{"commands":[]}
+```text
+PAUSED -> RUNNING
 ```
 
-When a gateway is reserved, the response contains a DOWNLOAD command:
+The scheduler only initiates new upgrades for `RUNNING` campaigns.
+
+Already-running upgrades may continue to report completion events while the campaign is paused.
+
+The current recovery service does not evaluate paused campaigns for timeouts.
+
+## Device Inform API
+
+Endpoint:
+
+```text
+POST /devices/{deviceId}/inform
+```
+
+Example request:
 
 ```json
 {
-  "commands": [{
-    "type": "DOWNLOAD",
-    "commandKey": "generated-command-uuid",
-    "url": "https://example.com/firmware/2.0.0.bin",
-    "targetVersion": "2.0.0"
-  }]
+  "deviceId": "DEVICE_ID",
+  "firmwareVersion": "1.0.0",
+  "event": "PERIODIC"
 }
 ```
 
-The controller saves the command key before returning the DOWNLOAD command.
+When no upgrade is assigned:
 
-### Command Response
+```json
+{
+  "commands": []
+}
+```
 
-A simulator gateway acknowledges a DOWNLOAD using:
+When an upgrade is scheduled:
+
+```json
+{
+  "commands": [
+    {
+      "type": "DOWNLOAD",
+      "commandKey": "generated-command-uuid",
+      "url": "https://example.com/firmware/2.0.0.bin",
+      "targetVersion": "2.0.0"
+    }
+  ]
+}
+```
+
+The command key is persisted before the controller returns the DOWNLOAD command.
+
+## Device Command Response API
+
+Endpoint:
+
+```text
+POST /devices/{deviceId}/command-response
+```
+
+Example:
 
 ```json
 {
@@ -382,152 +588,467 @@ A simulator gateway acknowledges a DOWNLOAD using:
 }
 ```
 
-A gateway may instead report `REJECTED`, optionally with a reason. The controller persists acknowledgment and device state changes.
+The device may also return `REJECTED` with an optional reason.
 
-### Upgrade Completion
+On acceptance, the controller transitions the device to `ACCEPTED` and records an upgrade completion deadline.
 
-The controller processes `TRANSFER_COMPLETE` and `BOOT` Inform events. A successful TransferComplete or BOOT reporting the target version while a matching upgrade is active can confirm completion. Failure fault codes mark the device as failed. Some out-of-order cases still require hardening.
+On rejection, it records `FAILED`.
+
+## Upgrade Completion Processing
+
+The controller recognizes:
+
+- Successful TransferComplete events
+- Nonzero TransferComplete fault codes
+- BOOT events reporting the target firmware version
+- Duplicate callbacks for already-terminal devices in basic cases
+
+A successful TransferComplete is treated as a successful upgrade outcome in this simplified MVP.
+
+A more rigorous production implementation would require independent confirmation of the firmware version after reboot.
 
 ## Campaign Scheduler
 
-Scheduling is enabled via `@EnableScheduling` and configured with:
+The scheduler uses Spring's `@Scheduled` mechanism, enabled with:
 
-```yaml
-campaign:
-  scheduler-delay-ms: 2000
+```java
+@EnableScheduling
 ```
 
-Each tick retrieves running campaigns, counts their in-flight devices, reserves pending devices up to available capacity, and sends simulator connection requests. Reservations are persisted before outgoing HTTP calls. The active states are `NOTIFIED`, `DOWNLOAD_SENT`, and `ACCEPTED`.
+### Scheduler Workflow
+
+1. Retrieve campaigns with active or halted rollout state.
+2. Recover expired in-flight operations.
+3. Evaluate failure threshold and completion.
+4. Skip additional dispatch if the campaign is no longer RUNNING.
+5. Count current in-flight gateways.
+6. Calculate available capacity.
+7. Reserve eligible PENDING gateways.
+8. Persist NOTIFIED state.
+9. Send connection requests to the simulator.
+10. Process asynchronous callbacks and advance device states.
+
+### Concurrency Control
+
+Active states:
 
 ```text
-availableSlots = maxConcurrent - activeDeviceCount
+NOTIFIED
+DOWNLOAD_SENT
+ACCEPTED
 ```
 
-For a campaign configured with `maxConcurrent = 3`, the intended single-instance limit is three simultaneously active devices. A database query shows the current count; full temporal concurrency validation needs repeated sampling or automated tests.
+Available slots:
 
-The reservation service also checks for active upgrades on the same gateway across campaigns. This is an initial single-process safeguard, not a substitute for database locking or distributed coordination.
+```text
+availableSlots = maxConcurrent - activeDevices
+```
 
-**Known gap:** A failed connection request currently leaves the device `NOTIFIED`; automatic timeout and retry processing is not yet implemented.
+For a campaign configured with `maxConcurrent = 3`, the scheduler is designed to maintain no more than three in-flight gateways during normal single-instance operation.
 
-## H2 Persistence and Validation
+The reservation service checks whether a gateway is already participating in another active campaign.
 
-Open `http://localhost:8080/h2-console` when Spring Boot is running locally. Use the application datasource's JDBC URL (typically `jdbc:h2:file:./data/firmwaredb;DB_CLOSE_ON_EXIT=FALSE`), username `sa`, and a blank password.
+This implementation does not use distributed locking and does not guarantee atomic cross-campaign ownership under all concurrent callback conditions.
 
-### Campaigns
+## Timeout Recovery and Retry Policy
+
+The recovery service detects devices whose deadlines have expired.
+
+| Device State | Action |
+|---|---|
+| NOTIFIED | Retry connection request up to configured limit |
+| DOWNLOAD_SENT | Mark TIMED_OUT |
+| ACCEPTED | Mark TIMED_OUT |
+| SUCCEEDED | No retry |
+| FAILED | No retry |
+| TIMED_OUT | No retry |
+
+### Safe Retry Strategy
+
+Only connection requests are retried automatically.
+
+DOWNLOAD commands are not blindly resent because the device may have received the command even if the controller did not receive its acknowledgment.
+
+This avoids unnecessary duplicate firmware upgrades.
+
+### Terminal Timeout
+
+When retries are exhausted or a later-stage deadline expires:
+
+```text
+State = TIMED_OUT
+Deadline = null
+LastError = timeout reason
+```
+
+The corresponding device no longer occupies an in-flight upgrade slot.
+
+## Failure Threshold and Automatic Halt
+
+The controller calculates failure rate from terminal device outcomes.
+
+```text
+failureRatePercent =
+    (FAILED + TIMED_OUT) /
+    (SUCCEEDED + FAILED + TIMED_OUT) * 100
+```
+
+The threshold is evaluated only after the configured minimum number of terminal outcomes has been reached.
+
+Example:
+
+```text
+failureThresholdPercent = 20
+failureMinSampleSize = 5
+```
+
+If more than 20% of terminal outcomes are failures after at least five devices reach terminal states, the campaign becomes:
+
+```text
+HALTED
+```
+
+Once halted:
+
+- No additional pending devices are selected.
+- Existing in-flight upgrades may complete.
+- Existing in-flight devices may still time out.
+- The campaign remains halted when unscheduled pending devices remain.
+
+## Campaign Completion
+
+A campaign becomes:
+
+```text
+COMPLETED
+```
+
+when every enrolled gateway reaches a terminal state:
+
+```text
+SUCCEEDED
+FAILED
+TIMED_OUT
+```
+
+A completed campaign may contain both successful and unsuccessful upgrades.
+
+If all devices are terminal, completion takes precedence over the failure-threshold halt check in the current MVP.
+
+## H2 Database Validation
+
+Open:
+
+```text
+http://localhost:8080/h2-console
+```
+
+Connection settings:
+
+```text
+Driver: org.h2.Driver
+JDBC URL: jdbc:h2:file:./data/firmwaredb;DB_CLOSE_ON_EXIT=FALSE
+Username: sa
+Password: blank
+```
+
+### Verify Campaigns
 
 ```sql
-SELECT ID, TARGET_VERSION, SOURCE_VERSION, STATUS, CREATED_AT
+SELECT
+    ID,
+    TARGET_VERSION,
+    SOURCE_VERSION,
+    STATUS,
+    CREATED_AT
 FROM CAMPAIGNS
 ORDER BY CREATED_AT DESC;
 ```
 
-### Devices per campaign
+### Verify Campaign Devices
 
 ```sql
-SELECT CAMPAIGN_ID, STATE, COUNT(*) AS DEVICE_COUNT
-FROM CAMPAIGN_DEVICES
-GROUP BY CAMPAIGN_ID, STATE
-ORDER BY CAMPAIGN_ID, STATE;
+SELECT
+    CAMPAIGN_ID,
+    DEVICE_ID,
+    CURRENT_VERSION,
+    STATE
+FROM CAMPAIGN_DEVICES;
 ```
 
-### Device state details
+### Count Devices by State
 
 ```sql
-SELECT DEVICE_ID, CURRENT_VERSION, STATE, ATTEMPTS, LAST_ERROR
+SELECT
+    STATE,
+    COUNT(*) AS DEVICE_COUNT
 FROM CAMPAIGN_DEVICES
 WHERE CAMPAIGN_ID = 'YOUR_CAMPAIGN_ID'
-ORDER BY DEVICE_ID;
+GROUP BY STATE;
 ```
 
-### DOWNLOAD commands and correlation keys
+### Verify Upgrade Commands
 
 ```sql
-SELECT COMMAND_KEY, CAMPAIGN_ID, DEVICE_ID, TARGET_VERSION, STATUS, FAULT_CODE
+SELECT
+    COMMAND_KEY,
+    CAMPAIGN_ID,
+    DEVICE_ID,
+    TARGET_VERSION,
+    STATUS,
+    FAULT_CODE
 FROM UPGRADE_COMMANDS
 WHERE CAMPAIGN_ID = 'YOUR_CAMPAIGN_ID';
 ```
 
-### Current in-flight count
+### Verify In-Flight Devices
 
 ```sql
 SELECT COUNT(*) AS IN_FLIGHT
 FROM CAMPAIGN_DEVICES
 WHERE CAMPAIGN_ID = 'YOUR_CAMPAIGN_ID'
-  AND STATE IN ('NOTIFIED', 'DOWNLOAD_SENT', 'ACCEPTED');
+AND STATE IN ('NOTIFIED', 'DOWNLOAD_SENT', 'ACCEPTED');
 ```
 
-Campaign creation, pause/resume, and persisted campaign/device records have been validated. SQL queries have also been used to inspect scheduler device states and upgrade command records.
+For a fully completed campaign, this value should be zero.
+
+### Verify Timeout and Retry Data
+
+```sql
+SELECT
+    DEVICE_ID,
+    STATE,
+    ATTEMPTS,
+    DEADLINE_AT,
+    LAST_ERROR
+FROM CAMPAIGN_DEVICES
+WHERE CAMPAIGN_ID = 'YOUR_CAMPAIGN_ID'
+ORDER BY DEVICE_ID;
+```
+
+### Verify Final Campaign Status
+
+```sql
+SELECT ID, STATUS, TARGET_VERSION
+FROM CAMPAIGNS
+WHERE ID = 'YOUR_CAMPAIGN_ID';
+```
+
+## End-to-End Testing
+
+Run the controller and simulator in separate VS Code terminals.
+
+### Terminal 1 — Spring Boot
+
+```cmd
+mvnw.cmd spring-boot:run
+```
+
+### Terminal 2 — Simulator
+
+```cmd
+simulator\run-simulator.cmd
+```
+
+### Terminal 3 — Validation
+
+```cmd
+curl http://localhost:8080/actuator/health
+curl "http://localhost:9000/devices?version=1.0.0"
+```
+
+Create a new campaign:
+
+```cmd
+curl -X POST http://localhost:8080/campaigns -H "Content-Type: application/json" --data-binary "@campaign-request.json"
+```
+
+Monitor campaign progress:
+
+```cmd
+curl http://localhost:8080/campaigns/CAMPAIGN_ID
+```
+
+Observe device states and command records through the H2 Console.
+
+Before starting a new test, pause older RUNNING campaigns to avoid overlapping upgrades against the same simulated devices.
+
+### Timeout Scenario
+
+For a controlled failure test:
+
+1. Create a new campaign.
+2. Allow some devices to enter NOTIFIED or another active state.
+3. Stop the Python simulator.
+4. Keep Spring Boot running.
+5. Inspect ATTEMPTS, STATE, and LAST_ERROR in H2.
+6. Verify bounded retries and eventual timeout.
+7. Check whether the failure threshold causes the campaign to HALT.
+
+Stopping the simulator can interrupt already-running downloads, so additional timeouts may occur.
+
+## MVP Validation Results
+
+Complete this section after running the final end-to-end test.
+
+### Environment
+
+| Parameter | Value |
+|---|---|
+| Java | 17 |
+| Spring Boot | 4.1.2 |
+| Database | H2 file-based |
+| Simulator | Python FastAPI |
+| Device Count | 10 |
+| Scheduler Interval | 2 seconds |
+| Maximum Concurrent Upgrades | 3 |
+| Source Firmware | 1.0.0 |
+| Target Firmware | 2.0.0 |
+
+### Actual Campaign Results
+
+| Metric | Result |
+|---|---|
+| Campaign ID | Pending validation |
+| Eligible Gateways | Pending validation |
+| Successful Upgrades | Pending validation |
+| Failed Upgrades | Pending validation |
+| Timed-Out Upgrades | Pending validation |
+| Final Campaign Status | Pending validation |
+| Failure Percentage | Pending validation |
+
+These placeholders should be replaced with measured values from H2 and the campaign status API before final submission.
 
 ## Testing Status
 
-### Validated so far
+### Previously Validated
 
-- Local Maven build and Spring Boot health endpoint
-- Docker Compose startup and health endpoint
-- Python simulator startup and 10-device inventory retrieval
-- Campaign creation, status, pause, and resume APIs
-- H2 persistence of campaigns and their device records
-- Device Inform endpoint returning `{"commands":[]}` when no upgrade is assigned
-- Scheduler-related device-state and upgrade-command inspection in H2
+- Maven build and Spring Boot startup before the latest recovery changes
+- Actuator health endpoint
+- Docker Compose health check
+- Python simulator startup and inventory retrieval
+- Campaign creation
+- Campaign status retrieval
+- Campaign pause and resume
+- H2 persistence of campaigns and associated devices
+- Device Inform returning an empty command list when no command is assigned
+- Scheduler-related device-state and upgrade-command records inspected in H2
 
-### Remaining validation
+### Final Validation Pending
 
-- Full repeated 10-device upgrade run with terminal outcome counts
-- Automated assertion of maximum in-flight concurrency throughout the run
-- Offline gateway, rejected command, and failed transfer scenarios
-- BOOT without TransferComplete; duplicate, delayed, and out-of-order callbacks
-- Timeout enforcement and bounded retry behavior
-- Automatic failure-threshold halt with a minimum observation sample
-- Automatic campaign completion and restart recovery
-- A 1,000-device run and documented outcomes/performance
+- Successful compilation of the latest CampaignRecoveryService integration
+- Bounded notification retries
+- Timeout transitions to TIMED_OUT
+- Failure-threshold HALTED transition
+- Automatic COMPLETED transition
+- Fresh end-to-end 10-device campaign
+- Actual run statistics
+- Optional larger fleet test
+- Restart and late-callback edge cases
 
 ## Observability
 
-Spring Boot Actuator provides a health endpoint and, when exposed in application configuration, a metrics endpoint:
+Spring Boot Actuator provides application health checks.
 
 ```text
 /actuator/health
+```
+
+The metrics endpoint can also be exposed through Actuator configuration:
+
+```text
 /actuator/metrics
 ```
 
-Planned domain-specific metrics include connection requests, commands sent, acknowledgments, successes, failures, timeouts, in-flight counts, and campaign completion durations.
+Possible future domain metrics include:
+
+- Total connection requests
+- Download commands issued
+- Command acceptances and rejections
+- Successful upgrades
+- Failed upgrades
+- Timed-out upgrades
+- Current in-flight operations
+- Campaign execution duration
 
 ## Design Decisions and Trade-offs
 
-| Decision | Rationale | Limitation / next improvement |
+| Decision | Rationale | Trade-off |
 |---|---|---|
-| Spring Boot application | Simple deployment and transactional persistence | A single instance limits orchestration scale |
-| File-backed H2 | Lightweight, persistent local storage | Use a shared production database for multi-instance deployments |
-| Separate campaign/device/command entities | Retain campaign-level configuration, per-device progress, and command correlation | More database operations; useful for audit and recovery |
-| Scheduler-based dispatch | Nonblocking orchestration, explicit in-flight limits | Requires timeout/recovery processing and stronger locking |
-| Persistent `commandKey` | Correlates asynchronous responses and mitigates duplicate issuance | Late events and races still need more robust rules |
-| Firmware version confirmation on BOOT | Supports gateways that omit TransferComplete | Must guard against stale events and unrelated campaigns |
-| Pause/resume as campaign status | Prevent new scheduling while allowing in-flight completion | Does not cancel commands already issued |
+| Spring Boot application | Simplifies deployment and testing | Single-instance orchestration |
+| H2 file database | Lightweight persistent storage | Not suitable for distributed production deployment |
+| Separate campaign/device/command entities | Clear state ownership and auditability | Additional database operations |
+| Scheduled orchestration | Controls in-flight upgrades asynchronously | Scheduler-based polling |
+| Persistent commandKey | Correlates asynchronous gateway events | Requires duplicate-event handling |
+| Bounded notification retries | Handles temporarily offline gateways | Adds retry state management |
+| Avoid duplicate DOWNLOAD retries | Prevents unintended repeated upgrades | May timeout when command outcome is uncertain |
+| Failure-threshold halt | Limits rollout risk | Depends on representative terminal outcomes |
+| BOOT target-version confirmation | Supports missing TransferComplete callbacks | Requires protection against stale events |
+
+## Known Limitations
+
+- Designed for one controller instance.
+- No distributed locks or leader election.
+- Cross-campaign reservations are not fully protected against concurrent races.
+- Late callbacks after a terminal timeout are not comprehensively reconciled.
+- Some duplicate and out-of-order callback scenarios require additional hardening.
+- A successful TransferComplete is treated as upgrade success without independent post-reboot verification.
+- No production authentication or gateway authorization.
+- No firmware image signing or integrity validation.
+- No measured 1,000-device performance benchmark.
+- Simulator emulates firmware upgrades rather than upgrading physical devices.
 
 ## Scaling Considerations
 
-For fleets measured in millions of gateways, the local design would need shared persistence, partitioned campaign work, distributed leasing/locking, bounded request rates, queue- or event-driven callback processing, durable retry/dead-letter handling, observability, and explicit backpressure. A production implementation would also require authentication/authorization, firmware artifact validation, and operational audit history.
+For fleets containing millions of gateways, a production architecture would likely require:
+
+- Shared relational persistence
+- Partitioned campaign scheduling
+- Distributed worker coordination
+- Device-level leases or locks
+- Queue-based dispatch and event processing
+- Bounded retry and dead-letter handling
+- Rate limiting and backpressure
+- Horizontally scalable callback APIs
+- Durable event correlation and audit records
+- Metrics, tracing, and operational dashboards
+- Authentication and firmware artifact verification
 
 ## Implementation Status
 
-### Completed
+### Implemented in Code
 
-- Spring Boot 4.1.2 project, Java 17 target, Maven, Docker Compose
-- H2 file-backed persistence, JPA entities and repositories
-- Campaign create/status/pause/resume APIs and simulator inventory integration
-- Device Inform and Command Response endpoints
-- Persistent DOWNLOAD command keys and acknowledgment handling
-- BOOT and TransferComplete handlers for the initial upgrade flow
-- Initial scheduled campaign dispatch with per-campaign slot calculation
-- Initial protection against overlapping in-flight upgrades in one controller instance
-- Manual API and H2 validation of implemented functionality
+- Spring Boot 4.1.2 with Java 17
+- Maven build and Docker Compose configuration
+- H2 persistence
+- Campaign, device, and command entities
+- Campaign creation, status, pause, and resume
+- Device Inform and Command Response APIs
+- DOWNLOAD command issuance and commandKey persistence
+- BOOT and TransferComplete event handling
+- Campaign scheduler
+- Basic per-campaign concurrency control
+- Notification retry configuration
+- Notification, acknowledgment, and upgrade deadlines
+- Timeout recovery logic
+- Automatic failure-threshold halt logic
+- Campaign completion logic
 - Architecture, sequence, and state-machine diagrams
 
-### In Progress / Planned
+### Remaining Before Final MVP Validation
 
-- Expired-operation detection and bounded retries
-- Failure-threshold enforcement and campaign completion status
-- Stronger concurrent callback, duplicate, and late-event handling
-- Controller restart/in-flight recovery validation
-- Domain-specific metrics and end-to-end run report
-- Larger fleet validation (including 1,000 simulated gateways)
+- Resolve any outstanding compilation or test failures
+- Run one complete 10-device campaign
+- Verify final COMPLETED or HALTED status
+- Capture actual success, failure, and timeout counts
+- Commit the tested implementation and updated documentation
+
+### Future Enhancements
+
+- Distributed scheduling and database locking
+- Comprehensive callback idempotency
+- Late-event reconciliation
+- Automated integration and load testing
+- Custom operational metrics
+- Production-grade security
+- Larger-fleet scalability improvements
