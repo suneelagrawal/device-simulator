@@ -1,4 +1,3 @@
-
 package device.simulator.service;
 
 import device.simulator.dto.*;

@@ -1,4 +1,3 @@
-
 package device.simulator.service;
 
 import device.simulator.dto.DeviceInformRequest;
@@ -10,15 +9,16 @@ import device.simulator.repository.CampaignRepository;
 import device.simulator.repository.CampaignDeviceRepository;
 import device.simulator.repository.UpgradeCommandRepository;
 
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
-import org.springframework.http.HttpStatus;
 
 import java.time.Instant;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -28,13 +28,24 @@ public class DeviceUpgradeService {
     private final CampaignDeviceRepository deviceRepository;
     private final UpgradeCommandRepository commandRepository;
 
+    private final long acknowledgmentTimeoutSeconds;
+    private final long upgradeTimeoutSeconds;
+
     public DeviceUpgradeService(
             CampaignRepository campaignRepository,
             CampaignDeviceRepository deviceRepository,
-            UpgradeCommandRepository commandRepository) {
+            UpgradeCommandRepository commandRepository,
+            @Value("${campaign.acknowledgment-timeout-seconds:20}")
+            long acknowledgmentTimeoutSeconds,
+            @Value("${campaign.upgrade-timeout-seconds:90}")
+            long upgradeTimeoutSeconds) {
+
         this.campaignRepository = campaignRepository;
         this.deviceRepository = deviceRepository;
         this.commandRepository = commandRepository;
+        this.acknowledgmentTimeoutSeconds =
+                acknowledgmentTimeoutSeconds;
+        this.upgradeTimeoutSeconds = upgradeTimeoutSeconds;
     }
 
     private boolean terminal(String state) {
@@ -42,39 +53,57 @@ public class DeviceUpgradeService {
                 .contains(state);
     }
 
+    private CampaignDevice findDevice(
+            String campaignId, String deviceId) {
+
+        return deviceRepository
+                .findByCampaignIdAndDeviceId(campaignId, deviceId)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND,
+                        "Campaign device not found"));
+    }
+
     @Transactional
     public Map<String, Object> handleInform(
-            String deviceId, DeviceInformRequest request) {
+            String deviceId,
+            DeviceInformRequest request) {
 
-        if (!deviceId.equals(request.deviceId())) {
+        if (request == null
+                || request.deviceId() == null
+                || !deviceId.equals(request.deviceId())) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST, "Device ID mismatch");
         }
 
-        // A completion event is correlated by commandKey,
-        // not by whichever campaign happens to be running.
+        // Correlate completion events to the exact command.
         if ("TRANSFER_COMPLETE".equals(request.event())) {
             processTransferComplete(deviceId, request);
             return Map.of("commands", List.of());
         }
 
-        for (Campaign campaign : campaignRepository.findAll()) {
+        // Deterministic order for local single-instance testing.
+        List<Campaign> campaigns = campaignRepository.findAll()
+                .stream()
+                .sorted(Comparator.comparing(
+                        Campaign::getCreatedAt,
+                        Comparator.nullsLast(
+                                Comparator.naturalOrder())))
+                .toList();
 
-            Optional<CampaignDevice> found =
-                    deviceRepository.findByCampaignIdAndDeviceId(
+        for (Campaign campaign : campaigns) {
+
+            var optional = deviceRepository
+                    .findByCampaignIdAndDeviceId(
                             campaign.getId(), deviceId);
 
-            if (found.isEmpty()) {
+            if (optional.isEmpty()) {
                 continue;
             }
 
-            CampaignDevice device = found.get();
+            CampaignDevice device = optional.get();
 
-            if (terminal(device.getState())) {
-                continue;
-            }
-
-            // A BOOT reporting target firmware confirms success.
+            // BOOT reporting target firmware is sufficient
+            // evidence when a DOWNLOAD was already issued.
             if ("BOOT".equals(request.event())
                     && List.of("DOWNLOAD_SENT", "ACCEPTED")
                             .contains(device.getState())
@@ -83,13 +112,15 @@ public class DeviceUpgradeService {
 
                 device.setState("SUCCEEDED");
                 device.setCurrentVersion(request.firmwareVersion());
+                device.setDeadlineAt(null);
                 deviceRepository.save(device);
 
                 for (UpgradeCommand command :
                         commandRepository.findByCampaignIdAndDeviceId(
                                 campaign.getId(), deviceId)) {
 
-                    if (!"FAILED".equals(command.getStatus())) {
+                    if (!"FAILED".equals(command.getStatus())
+                            && !"REJECTED".equals(command.getStatus())) {
                         command.setStatus("CONFIRMED_BY_BOOT");
                         command.setCompletedAt(Instant.now());
                         commandRepository.save(command);
@@ -99,17 +130,22 @@ public class DeviceUpgradeService {
                 return Map.of("commands", List.of());
             }
 
-            // Only issue a DOWNLOAD when the gateway has
-            // been selected and notified by the scheduler.
+            // Never issue a command to a terminal device.
+            if (terminal(device.getState())) {
+                continue;
+            }
+
+            // Only a scheduler-reserved gateway may
+            // receive DOWNLOAD, even if it sends Inform.
             if (!"RUNNING".equals(campaign.getStatus())
                     || !"NOTIFIED".equals(device.getState())) {
                 continue;
             }
 
-            String key = UUID.randomUUID().toString();
+            String commandKey = UUID.randomUUID().toString();
 
             UpgradeCommand command = new UpgradeCommand();
-            command.setCommandKey(key);
+            command.setCommandKey(commandKey);
             command.setCampaignId(campaign.getId());
             command.setDeviceId(deviceId);
             command.setTargetVersion(campaign.getTargetVersion());
@@ -118,16 +154,16 @@ public class DeviceUpgradeService {
             commandRepository.save(command);
 
             device.setState("DOWNLOAD_SENT");
+            device.setDeadlineAt(Instant.now().plusSeconds(
+                    acknowledgmentTimeoutSeconds));
             deviceRepository.save(device);
 
-            Map<String, String> download = Map.of(
+            return Map.of("commands", List.of(Map.of(
                     "type", "DOWNLOAD",
-                    "commandKey", key,
+                    "commandKey", commandKey,
                     "url", campaign.getImageUrl(),
                     "targetVersion", campaign.getTargetVersion()
-            );
-
-            return Map.of("commands", List.of(download));
+            )));
         }
 
         return Map.of("commands", List.of());
@@ -135,7 +171,13 @@ public class DeviceUpgradeService {
 
     @Transactional
     public void handleCommandResponse(
-            String deviceId, DeviceCommandResponse response) {
+            String deviceId,
+            DeviceCommandResponse response) {
+
+        if (response == null || response.commandKey() == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "Missing commandKey");
+        }
 
         UpgradeCommand command = commandRepository
                 .findById(response.commandKey())
@@ -147,29 +189,37 @@ public class DeviceUpgradeService {
                     HttpStatus.BAD_REQUEST, "Device ID mismatch");
         }
 
-        CampaignDevice device = deviceRepository
-                .findByCampaignIdAndDeviceId(
-                        command.getCampaignId(), deviceId)
-                .orElseThrow();
+        CampaignDevice device = findDevice(
+                command.getCampaignId(), deviceId);
 
-        // Ignore duplicate or late acknowledgments
-        // after a terminal device outcome.
         if (terminal(device.getState())) {
             return;
         }
 
         if ("ACCEPTED".equals(response.status())) {
+
+            // Repeated ACCEPTED acknowledgments are harmless.
             if ("DOWNLOAD_SENT".equals(device.getState())) {
                 command.setStatus("ACCEPTED");
                 device.setState("ACCEPTED");
+                device.setDeadlineAt(Instant.now().plusSeconds(
+                        upgradeTimeoutSeconds));
             }
+
         } else if ("REJECTED".equals(response.status())) {
+
             command.setStatus("REJECTED");
             device.setState("FAILED");
-            device.setLastError(response.reason());
+            device.setDeadlineAt(null);
+            device.setLastError(
+                    response.reason() == null
+                            ? "DOWNLOAD rejected"
+                            : response.reason());
+
         } else {
             throw new ResponseStatusException(
-                    HttpStatus.BAD_REQUEST, "Invalid command status");
+                    HttpStatus.BAD_REQUEST,
+                    "Invalid command response status");
         }
 
         commandRepository.save(command);
@@ -177,13 +227,14 @@ public class DeviceUpgradeService {
     }
 
     private void processTransferComplete(
-            String deviceId, DeviceInformRequest request) {
+            String deviceId,
+            DeviceInformRequest request) {
 
         if (request.transferComplete() == null
                 || request.transferComplete().commandKey() == null) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST,
-                    "Missing transferComplete commandKey");
+                    "Missing TransferComplete commandKey");
         }
 
         var event = request.transferComplete();
@@ -198,10 +249,8 @@ public class DeviceUpgradeService {
                     HttpStatus.BAD_REQUEST, "Device ID mismatch");
         }
 
-        CampaignDevice device = deviceRepository
-                .findByCampaignIdAndDeviceId(
-                        command.getCampaignId(), deviceId)
-                .orElseThrow();
+        CampaignDevice device = findDevice(
+                command.getCampaignId(), deviceId);
 
         if (terminal(device.getState())) {
             return;
@@ -216,15 +265,22 @@ public class DeviceUpgradeService {
         command.setCompletedAt(Instant.now());
 
         if (event.faultCode() == 0) {
+
             command.setStatus("SUCCEEDED");
             device.setState("SUCCEEDED");
-            device.setCurrentVersion(request.firmwareVersion());
+            // Simplified MVP: successful TransferComplete
+            // is treated as successful upgrade completion.
+            device.setCurrentVersion(command.getTargetVersion());
+
         } else {
+
             command.setStatus("FAILED");
             device.setState("FAILED");
             device.setLastError(
                     "TransferComplete fault: " + event.faultCode());
         }
+
+        device.setDeadlineAt(null);
 
         commandRepository.save(command);
         deviceRepository.save(device);

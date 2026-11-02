@@ -1,4 +1,3 @@
-
 package device.simulator.repository;
 
 import device.simulator.entity.CampaignDevice;

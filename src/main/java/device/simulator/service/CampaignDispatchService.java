@@ -1,11 +1,11 @@
-
 package device.simulator.service;
 
 import device.simulator.entity.Campaign;
 import device.simulator.entity.CampaignDevice;
-import device.simulator.repository.CampaignRepository;
 import device.simulator.repository.CampaignDeviceRepository;
+import device.simulator.repository.CampaignRepository;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,17 +21,19 @@ public class CampaignDispatchService {
 
     private final CampaignRepository campaignRepository;
     private final CampaignDeviceRepository deviceRepository;
+    private final long notificationTimeoutSeconds;
 
     public CampaignDispatchService(
             CampaignRepository campaignRepository,
-            CampaignDeviceRepository deviceRepository) {
+            CampaignDeviceRepository deviceRepository,
+            @Value("${campaign.notification-timeout-seconds:15}")
+            long notificationTimeoutSeconds) {
 
         this.campaignRepository = campaignRepository;
         this.deviceRepository = deviceRepository;
+        this.notificationTimeoutSeconds = notificationTimeoutSeconds;
     }
 
-    // Single-instance reservation logic.
-    // Distributed deployments require DB-level coordination.
     @Transactional
     public synchronized List<String> reserveDevices(String campaignId) {
 
@@ -45,22 +47,18 @@ public class CampaignDispatchService {
         List<CampaignDevice> devices =
                 deviceRepository.findByCampaignId(campaignId);
 
-        long inFlight = devices.stream()
+        long activeCount = devices.stream()
                 .filter(d -> ACTIVE_STATES.contains(d.getState()))
                 .count();
 
-        long availableSlots = Math.max(
-                0, (long) campaign.getMaxConcurrent() - inFlight);
+        int available = (int) Math.max(0,
+                (long) campaign.getMaxConcurrent() - activeCount);
 
-        List<String> selected = new ArrayList<>();
-
-        if (availableSlots == 0) {
-            return selected;
-        }
+        List<String> reserved = new ArrayList<>();
 
         for (CampaignDevice device : devices) {
 
-            if (selected.size() >= availableSlots) {
+            if (reserved.size() >= available) {
                 break;
             }
 
@@ -68,7 +66,6 @@ public class CampaignDispatchService {
                 continue;
             }
 
-            // Avoid overlapping active upgrades on one gateway.
             if (deviceRepository.existsByDeviceIdAndStateIn(
                     device.getDeviceId(), ACTIVE_STATES)) {
                 continue;
@@ -76,12 +73,13 @@ public class CampaignDispatchService {
 
             device.setState("NOTIFIED");
             device.setAttempts(device.getAttempts() + 1);
-            device.setDeadlineAt(Instant.now().plusSeconds(60));
+            device.setDeadlineAt(
+                    Instant.now().plusSeconds(notificationTimeoutSeconds));
 
             deviceRepository.save(device);
-            selected.add(device.getDeviceId());
+            reserved.add(device.getDeviceId());
         }
 
-        return selected;
+        return reserved;
     }
 }

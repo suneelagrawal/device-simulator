@@ -10,7 +10,7 @@ public record DeviceInformRequest(
     public record TransferComplete(
             String commandKey,
             Integer faultCode,
-            Double startTime,
-            Double completeTime
+            Object startTime,
+            Object completeTime
     ) {}
 }

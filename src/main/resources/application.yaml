@@ -34,3 +34,8 @@ simulator:
 
 campaign:
   scheduler-delay-ms: 2000
+  max-notification-attempts: 3
+  notification-timeout-seconds: 15
+  acknowledgment-timeout-seconds: 20
+  upgrade-timeout-seconds: 90
+  failure-min-sample-size: 5
